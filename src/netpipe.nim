@@ -1,16 +1,18 @@
-import nativesockets, net, times, sequtils, random
+import posix, nativesockets, net, times, sequtils, random
 
 randomize()
 
 export Port
 
 const
+  MAX_PACKET_SIZE = 508
   partMagic = uint32(0xFFDDFF33)
   ackMagic = uint32(0xFF33FF11)
   punchMagic = uint32(0x00000000)
 
-const headerSize = 4 + 4 + 4 + 2 + 2
-var maxUdpPacket = 508 - headerSize
+const
+  headerSize = 4 + 4 + 4 + 2 + 2
+  maxUdpPacket = MAX_PACKET_SIZE - headerSize
 
 
 const ackTime = 0.250 # time to wait before sending the packet again
@@ -121,19 +123,21 @@ proc tick*(reactor: Reactor)
 
 proc newReactor*(address: Address): Reactor =
   ## Creates a new reactor with address
-  var reactor = Reactor()
-  reactor.address = address
-  reactor.socket = newSocket(Domain.AF_INET, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP, false)
-  reactor.socket.getFd().setBlocking(false)
-  reactor.socket.bindAddr(reactor.address.port, reactor.address.host)
-  let (_, portLocal) = reactor.socket.getLocalAddr()
-  reactor.address.port = portLocal
-  reactor.connections = @[]
-  reactor.simDropRate = 0.0 #
-  reactor.maxInFlight = 25000 # don't have more then 250K in flight on the socket
-  reactor.tick()
-  return reactor
-
+  new(result)
+  result.address = address
+  result.socket = newSocket(Domain.AF_INET, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP, false)
+  result.socket.setSockOpt(OptReuseAddr, true)
+  result.socket.setSockOpt(OptReusePort, true)
+  result.socket.getFd().setBlocking(false)
+  result.socket.bindAddr(result.address.port, result.address.host)
+  if address.host.len == 0:
+    let (_, portLocal) = result.socket.getLocalAddr()
+    result.address.port = portLocal
+  result.connections = @[]
+  result.simDropRate = 0.0 #
+  result.maxInFlight = 25000 # don't have more then 250K in flight on the socket
+  when not compileOption("threads"):
+    result.tick()
 
 proc newReactor*(host: string, port: int): Reactor =
   ## Creates a new reactor with host and port
@@ -227,7 +231,6 @@ proc divideAndSend(reactor: Reactor, conn: Connection, data: string) =
     conn.sentParts.add(part)
   inc conn.sendSequenceNum
 
-
 proc rawSend(conn: Connection, data: pointer, dataLen: int) =
   ## Low level send to a socket
   if conn.reactor.simDropRate != 0:
@@ -298,19 +301,28 @@ proc deleteAckedParts(reactor: Reactor) =
 
 proc readParts(reactor: Reactor) =
   var
-    data = newStringOfCap(maxUdpPacket)
+    data = newString(MAX_PACKET_SIZE)
     address = Address()
     bytesRead: int
-
-  # read 1000 parts
-  for i in 0..<1000:
+    rfds: TFdSet
+    tv: Timeval
+  tv.tv_usec = 250.Suseconds
+  for i in 0..1:
     try:
-      bytesRead = reactor.socket.recvFrom(data, maxUdpPacket + headerSize, address.host, address.port)
+      #var rfds = @[reactor.socket.getFd()]
+      #var t = selectRead(rfds, 1)
+      var fd = reactor.socket.getFd()
+      FD_ZERO(rfds)
+      FD_SET(fd, rfds)
+      let t = int(select(cint(fd.int+1), addr rfds, nil, nil, addr tv))
+      if t >= 0:
+        bytesRead = reactor.socket.recvFrom(data, MAX_PACKET_SIZE, address.host, address.port)
+        if bytesRead < headerSize:
+          echo "failed to recv ", $reactor.address
+          break
     except:
       break
-    if bytesRead < headerSize:
-      echo "failed to recv ", $reactor.address
-      break
+
 
     var header = cast[ptr PartHeader](data.cstring)
 
