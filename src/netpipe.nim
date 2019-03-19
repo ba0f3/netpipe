@@ -1,5 +1,4 @@
-import hashes, nativesockets, net, tables, times, random, sequtils
-#import netpipe/osrandom
+import nativesockets, net, times, sequtils, random
 
 randomize()
 
@@ -106,14 +105,6 @@ proc `[]`*(p: pointer, i: int): pointer =
   cast[pointer](cast[int](p) + i)
 
 
-proc hash*(x: Address): Hash =
-  ## Computes a Hash from and address
-  var h: Hash = 0
-  h = h !& hash(x.host)
-  h = h !& hash(x.port)
-  result = !$h
-
-
 proc removeBack[T](s: var seq[T], what: T) =
   ## Remove an element in a seq, by copying the last element
   ## over its pos and shrinking seq by 1
@@ -135,7 +126,7 @@ proc newReactor*(address: Address): Reactor =
   reactor.socket = newSocket(Domain.AF_INET, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP, false)
   reactor.socket.getFd().setBlocking(false)
   reactor.socket.bindAddr(reactor.address.port, reactor.address.host)
-  let (hostLocal, portLocal) = reactor.socket.getLocalAddr()
+  let (_, portLocal) = reactor.socket.getLocalAddr()
   reactor.address.port = portLocal
   reactor.connections = @[]
   reactor.simDropRate = 0.0 #
@@ -237,29 +228,16 @@ proc divideAndSend(reactor: Reactor, conn: Connection, data: string) =
   inc conn.sendSequenceNum
 
 
-proc rawSend(reactor: Reactor, address: Address, data: pointer, dataLen: int) =
+proc rawSend(conn: Connection, data: pointer, dataLen: int) =
   ## Low level send to a socket
-  if reactor.simDropRate != 0:
+  if conn.reactor.simDropRate != 0:
     # drop % of packets
-    if rand(1.0) <= reactor.simDropRate:
+    if rand(1.0) <= conn.reactor.simDropRate:
       return
   try:
-    reactor.socket.sendTo(address.host, address.port, data, dataLen)
+    conn.reactor.socket.sendTo(conn.address.host, conn.address.port, data, dataLen)
   except:
     return
-
-
-proc rawSend(reactor: Reactor, address: Address, data: string) =
-  ## Low level send to a socket
-  if reactor.simDropRate != 0:
-    # drop % of packets
-    if rand(1.0) <= reactor.simDropRate:
-      return
-  try:
-    reactor.socket.sendTo(address.host, address.port, data)
-  except:
-    return
-
 
 proc sendNeededParts(reactor: Reactor) =
   var i = 0
@@ -295,15 +273,15 @@ proc sendNeededParts(reactor: Reactor) =
         inc part.numSent
         part.lastTime = reactor.time
         try:
-          reactor.rawSend(conn.address, packet, packetLen)
+          conn.rawSend(packet, packetLen)
         finally:
           dealloc(packet)
 
 
-proc sendSpecial(reactor: Reactor, conn: Connection, part: Part, magic: uint32) =
+proc sendSpecial(conn: Connection, part: Part, magic: uint32) =
   var header = part.header
   header.magic = magic
-  reactor.rawSend(conn.address, addr header, headerSize)
+  conn.rawSend(addr header, headerSize)
 
 
 proc deleteAckedParts(reactor: Reactor) =
@@ -361,7 +339,7 @@ proc readParts(reactor: Reactor) =
       # insert packets in the correct order
       part.acked = true
       part.ackedTime = reactor.time
-      reactor.sendSpecial(conn, part, ackMagic)
+      conn.sendSpecial(part, ackMagic)
 
       var pos = 0
       if header.sequenceNum >= uint32(conn.recvSequenceNum):
