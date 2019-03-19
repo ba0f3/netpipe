@@ -1,6 +1,7 @@
-import hashes, nativesockets, net, tables, times, streams, random, sequtils
+import hashes, nativesockets, net, tables, times, random, sequtils
 #import netpipe/osrandom
 
+randomize()
 
 export Port
 
@@ -47,13 +48,16 @@ type
     sendSequenceNum: int
     recvSequenceNum: int
 
-  Part* = ref object
-    ## Part of a packet
+  PartHeader* {.packed.} = object
+    magic*: uint32
     sequenceNum*: uint32 # which packet seq is it
     rid: uint32 # random number that is this connect
-    numParts*: uint16 # number of parts
     partNum*: uint16 # which par is it
+    numParts*: uint16 # number of parts
 
+
+  Part* = ref object
+    header*: PartHeader
     # sending
     firstTime: float64
     lastTime: float64
@@ -90,12 +94,16 @@ proc `$`*(conn: Connection): string =
 
 proc `$`*(part: Part): string =
   ## Part to string
-  "Part(" & $part.sequenceNum & ":" & $part.partNum & "/" & $part.numParts & " ACK:" & $part.acked & ")"
+  "Part(" & $part.header.sequenceNum & ":" & $part.header.partNum & "/" & $part.header.numParts & " ACK:" & $part.acked & ")"
 
 
 proc `$`*(packet: Packet): string =
   ## Part to string
   "Packet(from: " & $packet.connection.address & " #" & $packet.sequenceNum & ", size:" & $packet.data.len & ")"
+
+
+proc `[]`*(p: pointer, i: int): pointer =
+  cast[pointer](cast[int](p) + i)
 
 
 proc hash*(x: Address): Hash =
@@ -172,7 +180,7 @@ proc read*(conn: Connection): Packet =
   if conn.recvParts.len == 0:
     return nil
 
-  let numParts = int conn.recvParts[0].numParts
+  let numParts = int conn.recvParts[0].header.numParts
   let sequenceNum = int conn.recvSequenceNum
   if conn.recvParts.len < numParts:
     return nil
@@ -180,9 +188,9 @@ proc read*(conn: Connection): Packet =
   # verify step
   var good = true
   for i in 0..<numParts:
-    if not (conn.recvParts[i].sequenceNum == uint32(sequenceNum) and
-        conn.recvParts[i].numParts == uint16(numParts) and
-        conn.recvParts[i].partNum == uint16(i)):
+    if not (conn.recvParts[i].header.sequenceNum == uint32(sequenceNum) and
+        conn.recvParts[i].header.numParts == uint16(numParts) and
+        conn.recvParts[i].header.partNum == uint16(i)):
       good = false
       break
 
@@ -213,20 +221,32 @@ proc divideAndSend(reactor: Reactor, conn: Connection, data: string) =
   var at = 0
   while at < data.len:
     var part = Part()
-    part.sequenceNum = uint32 conn.sendSequenceNum
-    part.partNum = partNum
+    part.header.sequenceNum = uint32 conn.sendSequenceNum
+    part.header.partNum = partNum
     let maxAt = min(at + maxUdpPacket, data.len)
     part.data = data[at ..< maxAt]
     inc partNum
     at = maxAt
     parts.add(part)
   for part in parts.mitems:
-    part.numParts = uint16 parts.len
-    part.rid = conn.rid
+    part.header.numParts = uint16 parts.len
+    part.header.rid = conn.rid
     part.firstTime = reactor.time
     part.lastTime = reactor.time
     conn.sentParts.add(part)
   inc conn.sendSequenceNum
+
+
+proc rawSend(reactor: Reactor, address: Address, data: pointer, dataLen: int) =
+  ## Low level send to a socket
+  if reactor.simDropRate != 0:
+    # drop % of packets
+    if rand(1.0) <= reactor.simDropRate:
+      return
+  try:
+    reactor.socket.sendTo(address.host, address.port, data, dataLen)
+  except:
+    return
 
 
 proc rawSend(reactor: Reactor, address: Address, data: string) =
@@ -266,30 +286,24 @@ proc sendNeededParts(reactor: Reactor) =
           reactor.connections.removeBack(conn)
           break
 
-        var packetData = newStringStream()
-        packetData.write(partMagic)
-        packetData.write(part.sequenceNum)
-        packetData.write(part.rid)
-        packetData.write(part.partNum)
-        packetData.write(part.numParts)
-        packetData.write(part.data)
-        packetData.setPosition(0)
-        var data = packetData.readAll()
+        var
+          packetLen = headerSize + part.data.len
+          packet = alloc0(packetLen)
+        part.header.magic = partMagic
+        copyMem(packet, addr part.header, headerSize)
+        copyMem(packet[headerSize], part.data.cstring, part.data.len)
         inc part.numSent
         part.lastTime = reactor.time
-        reactor.rawSend(conn.address, data)
+        try:
+          reactor.rawSend(conn.address, packet, packetLen)
+        finally:
+          dealloc(packet)
 
 
-proc sendSpecail(reactor: Reactor, conn: Connection, part: Part, magic: uint32) =
-  var packetData = newStringStream()
-  packetData.write(magic)
-  packetData.write(part.sequenceNum)
-  packetData.write(part.rid)
-  packetData.write(part.partNum)
-  packetData.write(part.numParts)
-  packetData.setPosition(0)
-  var data = packetData.readAll()
-  reactor.rawSend(conn.address, data)
+proc sendSpecial(reactor: Reactor, conn: Connection, part: Part, magic: uint32) =
+  var header = part.header
+  header.magic = magic
+  reactor.rawSend(conn.address, addr header, headerSize)
 
 
 proc deleteAckedParts(reactor: Reactor) =
@@ -305,64 +319,59 @@ proc deleteAckedParts(reactor: Reactor) =
 
 
 proc readParts(reactor: Reactor) =
-  var data = newStringOfCap(maxUdpPacket)
-  var host: string
-  var port: Port
-  var success: int
+  var
+    data = newStringOfCap(maxUdpPacket)
+    address = Address()
+    bytesRead: int
 
   # read 1000 parts
   for i in 0..<1000:
     try:
-      success = reactor.socket.recvFrom(data, maxUdpPacket + headerSize, host, port)
+      bytesRead = reactor.socket.recvFrom(data, maxUdpPacket + headerSize, address.host, address.port)
     except:
       break
-    if success < headerSize:
+    if bytesRead < headerSize:
       echo "failed to recv ", $reactor.address
       break
 
-    var part = Part()
-    var address = Address()
-    address.host = host
-    address.port = port
+    var header = cast[ptr PartHeader](data.cstring)
 
-    var stream = newStringStream(data)
-    var magic = stream.readUint32()
-    if magic == punchMagic:
+    if header.magic == punchMagic:
       #echo "got punched from", host, port
       continue
 
-    part.sequenceNum = stream.readUint32()
-    part.rid = stream.readUint32()
-    part.partNum = stream.readUint16()
-    part.numParts = stream.readUint16()
-    part.data = data[headerSize..^1]
 
-    var conn = reactor.getConn(address, part.rid)
+    var part = Part()
+    part.header = header[]
+
+    if bytesRead > headerSize:
+      part.data = data[headerSize..^1]
+
+    var conn = reactor.getConn(address, header.rid)
     if conn == nil:
-      if magic == partMagic and part.sequenceNum == 0 and part.partNum == 0:
+      if header.magic == partMagic and header.sequenceNum == 0 and header.partNum == 0:
         conn = newConnection(reactor, address)
-        conn.rid = part.rid
+        conn.rid = header.rid
         reactor.connections.add(conn)
         reactor.newConnections.add(conn)
         conn.connected = true
       else:
         continue
-
-    if magic == partMagic:
+    if header.magic == partMagic:
       # insert packets in the correct order
       part.acked = true
       part.ackedTime = reactor.time
-      reactor.sendSpecail(conn, part, ackMagic)
+      reactor.sendSpecial(conn, part, ackMagic)
 
       var pos = 0
-      if part.sequenceNum >= uint32(conn.recvSequenceNum):
+      if header.sequenceNum >= uint32(conn.recvSequenceNum):
         for p in conn.recvParts:
-          if p.sequenceNum > part.sequenceNum:
+          if p.header.sequenceNum > header.sequenceNum:
             break
-          elif p.sequenceNum == part.sequenceNum:
-            if p.partNum > part.partNum:
+          elif p.header.sequenceNum == header.sequenceNum:
+            if p.header.partNum > header.partNum:
               break
-            elif p.partNum == part.partNum:
+            elif p.header.partNum == header.partNum:
               # duplicate
               pos = -1
               assert p.data == part.data
@@ -371,11 +380,11 @@ proc readParts(reactor: Reactor) =
         if pos != -1:
           conn.recvParts.insert(part, pos)
 
-    elif magic == ackMagic:
+    elif header.magic == ackMagic:
       for p in conn.sentParts:
-        if p.sequenceNum == part.sequenceNum and
-            p.numParts == part.numParts and
-            p.partNum == part.partNum:
+        if p.header.sequenceNum == header.sequenceNum and
+           p.header.numParts == header.numParts and
+           p.header.partNum == header.partNum:
           # found a part that was being acked
           if not p.acked:
             p.acked = true
