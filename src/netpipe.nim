@@ -1,4 +1,4 @@
-import posix, nativesockets, net, times, sequtils, random
+import posix, nativesockets, net, times, sequtils, random, selectors
 
 randomize()
 
@@ -28,6 +28,7 @@ type
     ## Main networking system that can make or recive connections
     address*: Address
     socket*: Socket
+    selector: Selector[int]
     simDropRate: float
     maxInFlight: int
     time: float64
@@ -125,6 +126,7 @@ proc newReactor*(address: Address): Reactor =
   ## Creates a new reactor with address
   new(result)
   result.address = address
+  result.selector = newSelector[int]()
   result.socket = newSocket(Domain.AF_INET, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP, false)
   result.socket.setSockOpt(OptReuseAddr, true)
   result.socket.setSockOpt(OptReusePort, true)
@@ -136,6 +138,9 @@ proc newReactor*(address: Address): Reactor =
   result.connections = @[]
   result.simDropRate = 0.0 #
   result.maxInFlight = 25000 # don't have more then 250K in flight on the socket
+
+  result.selector.registerHandle(result.socket.getFd, {Event.Read}, 0)
+
   when not compileOption("threads"):
     result.tick()
 
@@ -307,19 +312,19 @@ proc readParts(reactor: Reactor) =
     rfds: TFdSet
     tv: Timeval
   tv.tv_usec = 250.Suseconds
+
   for i in 0..1:
     try:
       #var rfds = @[reactor.socket.getFd()]
       #var t = selectRead(rfds, 1)
-      var fd = reactor.socket.getFd()
-      FD_ZERO(rfds)
-      FD_SET(fd, rfds)
-      let t = int(select(cint(fd.int+1), addr rfds, nil, nil, addr tv))
-      if t >= 0:
-        bytesRead = reactor.socket.recvFrom(data, MAX_PACKET_SIZE, address.host, address.port)
-        if bytesRead < headerSize:
-          echo "failed to recv ", $reactor.address
-          break
+      #var fd = reactor.socket.getFd()
+      #FD_ZERO(rfds)
+      #FD_SET(fd, rfds)
+      #let t = int(select(cint(fd.int+1), addr rfds, nil, nil, addr tv))
+      bytesRead = reactor.socket.recvFrom(data, MAX_PACKET_SIZE, address.host, address.port)
+      if bytesRead < headerSize:
+        echo "failed to recv ", $reactor.address
+        break
     except:
       break
 
@@ -397,13 +402,20 @@ proc combinePackets(reactor: Reactor) =
 
 proc tick*(reactor: Reactor) =
   ## send and recives packets
+  var events: array[64, ReadyKey]
+
   reactor.time = epochTime()
   reactor.newConnections.setLen(0)
   reactor.deadConnections.setLen(0)
   reactor.packets.setLen(0)
   reactor.sendNeededParts()
   reactor.deleteAckedParts()
-  reactor.readParts()
+
+  reactor.selector.updateHandle(reactor.socket.getFd, {Event.Read})
+  let count = reactor.selector.selectInto(100, events)
+  for i in 0 ..< count:
+    if Event.Read in events[i].events:
+       reactor.readParts()
   reactor.combinePackets()
 
 
